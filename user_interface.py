@@ -68,6 +68,12 @@ class VideoPlayer:
             self.audio_channels = self.audio_stream.channels
             print(f"Audio: {self.audio_channels} channels @ {self.audio_sample_rate}Hz")
             
+        self.duration = float(self.stream.duration * self.stream.time_base)
+        self.current_time = 0.0
+        self.texture_id = gl.glGenTextures(1)
+        self.video_path = video_path
+        self.original_width = self.stream.width
+        self.original_height = self.stream.height
         # Initialize video dimensions and rotation
         self._init_video_dimensions()
         self.rotation = 0
