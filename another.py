@@ -28,6 +28,7 @@ from Cocoa import (
     NSScreen,
     NSApplication,
     NSButton,
+    NSMakeRect,
     NSBezelStyleRounded,
     NSWindowStyleMaskTitled,
     NSWindowStyleMaskClosable,
@@ -36,10 +37,32 @@ from Cocoa import (
     NSBackingStoreBuffered,
     NSApplicationActivationPolicyRegular,
     NSViewWidthSizable,
-    NSViewHeightSizable
+    NSViewHeightSizable,
+    NSViewMaxYMargin
 )
 import objc
 from CoreMedia import CMTimeMake
+
+from trimmerview import TrimmerView
+
+def setShowsTrimControls_(self, value):
+    pass
+
+def setCanShowTrimControls_(self, value):
+    pass
+
+def setTrimmingMode_(self, value):
+    pass
+
+# Create proper selectors
+objc.classAddMethods(AVPlayerView, [
+    objc.selector(setShowsTrimControls_, selector=b'setShowsTrimControls:', 
+                 signature=b'v@:Z', isClassMethod=False),
+    objc.selector(setCanShowTrimControls_, selector=b'setCanShowTrimControls:', 
+                 signature=b'v@:Z', isClassMethod=False),
+    objc.selector(setTrimmingMode_, selector=b'setTrimmingMode:', 
+                 signature=b'v@:Z', isClassMethod=False)
+])
 
 class VideoView(NSView):
     def initWithFrame_(self, frame):
@@ -55,7 +78,10 @@ class VideoView(NSView):
         self.player_view = AVPlayerView.alloc().init()
         self.player_view.setPlayer_(player)
         self.player_view.setFrame_(self.bounds())
-        
+        self.player_view.setShowsTimecodes_(True)
+        self.player_view.setShowsFrameSteppingButtons_(True)
+        self.player_view.setCanShowTrimControls_(True)
+        self.player_view.setShowsTrimControls_(True)
         # Make player view resize with parent view
         self.player_view.setAutoresizingMask_(
             NSViewWidthSizable | NSViewHeightSizable
@@ -123,6 +149,7 @@ class VideoPlayer(NSObject):
         self.view = VideoView.alloc().initWithFrame_(video_rect)
         
         # Create control buttons
+        ''' # hide play button for now
         button_width = 80
         button_height = 30
         button_y = 5
@@ -137,9 +164,18 @@ class VideoPlayer(NSObject):
         play_button.setBezelStyle_(NSBezelStyleRounded)
         play_button.setTarget_(self)
         play_button.setAction_(self.togglePlayPause_)
+        '''
+        #self.window.contentView().addSubview_(play_button) # hide play button for now
+        trimmer_frame = NSMakeRect(0, 0, self.window.frame().size.width, 100)
+        self.trimmer_view = TrimmerView.alloc().initWithFrame_(trimmer_frame)
+        self.window.contentView().addSubview_(self.trimmer_view)
         
+        # Position trimmer at bottom
+        self.trimmer_view.setAutoresizingMask_(
+            NSViewWidthSizable | NSViewMaxYMargin
+        )
         self.window.contentView().addSubview_(self.view)
-        self.window.contentView().addSubview_(play_button)
+
         self.window.makeKeyAndOrderFront_(None)
         
         self.current_frame = None
@@ -163,7 +199,7 @@ class VideoPlayer(NSObject):
         
         # Connect player to view
         self.view.setPlayer_(self.player)
-        
+        self.trimmer_view.setAsset_(self.player.currentItem().asset())
         output = AVPlayerItemVideoOutput.alloc().initWithPixelBufferAttributes_({
             kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA
         })
@@ -176,6 +212,7 @@ class VideoPlayer(NSObject):
             AVPlayerItemDidPlayToEndTimeNotification,
             self.player_item
         )
+
     def playerItemDidReachEnd_(self, notification):
         self.player.seekToTime_(CMTimeMake(0, 1))
         self.player.play()
