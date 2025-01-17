@@ -38,38 +38,38 @@ def check_side_data_ffprobe(filename):
 
 class VideoPlayer:
     def __init__(self, video_path):
+        self.video_path = video_path
         side = check_side_data_ffprobe(video_path)
         self.container = av.open(video_path)
         self.stream = self.container.streams.video[0]
         
         # Initialize audio components
         self.audio_stream = None
-        self.audio_queue = queue.Queue(maxsize=10)
-        self.audio_thread = None
+        self.audio_queue = queue.Queue(maxsize=100)  # Increased buffer size further
         self.is_playing = False
-        self.playback_speed = 1.0
-        self.next_frame_time = 0
+        self.audio_device = None
         
-        # Frame queue for video frames
-        self.frame_queue = queue.Queue(maxsize=3)
+        # Frame timing control
+        self.frame_rate = float(self.stream.guessed_rate or self.stream.rate or 30)
+        self.frame_interval = 1.0 / self.frame_rate
+        self.last_frame_time = 0
+        
+        # Frame buffer
+        self.current_frame = None
+        self.next_frame = None
+        self.next_frame_pts = None
         self.frame_ready = False
         
         # Try to get audio stream
         audio_streams = [s for s in self.container.streams if s.type == 'audio']
         if audio_streams:
             self.audio_stream = audio_streams[0]
-            self.audio_stream.thread_type = 'AUTO'
             self.audio_sample_rate = self.audio_stream.rate
             self.audio_channels = self.audio_stream.channels
+            print(f"Audio: {self.audio_channels} channels @ {self.audio_sample_rate}Hz")
             
-        self.duration = float(self.stream.duration * self.stream.time_base)
-        self.current_time = 0.0
-        self.texture_id = gl.glGenTextures(1)
-        self.video_path = video_path
-        self.original_width = self.stream.width
-        self.original_height = self.stream.height
-        
-        # Initialize rotation and dimensions
+        # Initialize video dimensions and rotation
+        self._init_video_dimensions()
         self.rotation = 0
         if side['has_side_data']:
             try:
@@ -95,7 +95,6 @@ class VideoPlayer:
             
         self._update_texture()
         
-
     def seek_frame(self, timestamp):
         try:
             # Allow seeking all the way to the end, but be extra careful
@@ -141,75 +140,106 @@ class VideoPlayer:
         except Exception as e:
             print(f"Seek error: {e}")
 
-    def _update_texture(self):
-        if self.rotation:
-            k = {
-                90: 1,
-                180: 2,
-                270: 3,
-                -90: 3,
-                -180: 2,
-                -270: 1
-            }.get(self.rotation, 0)
-            
-            if k:
-                self.current_frame = np.ascontiguousarray(np.rot90(self.current_frame, k=k))
+    def _init_video_dimensions(self):
+        self.original_width = self.stream.width
+        self.original_height = self.stream.height
+        self.rotation = self._get_rotation()
+        
+        if self.rotation in [90, 270, -90]:
+            self.frame_width = self.original_height
+            self.frame_height = self.original_width
+        else:
+            self.frame_width = self.original_width
+            self.frame_height = self.original_height
 
-        print(f"Frame shape after rotation: {self.current_frame.shape}")
-        
-        gl.glBindTexture(gl.GL_TEXTURE_2D, self.texture_id)
-        
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
-        
-        gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
-        
-        # Use the actual frame dimensions after rotation, not the stored frame dimensions
-        actual_height, actual_width = self.current_frame.shape[:2]
-        
-        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB, 
-                        actual_width, actual_height,
-                        0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, self.current_frame)
-        
-    def _decode_thread(self):
-        """Thread for decoding video frames"""
+    def _get_rotation(self):
+        try:
+            for s in self.stream.side_data:
+                if isinstance(s, av.VideoDisplayMatrix):
+                    return s.rotation
+        except Exception as e:
+            print(f"Error getting rotation: {e}")
+        return 0
+
+    def _audio_decode_thread(self):
+        """Dedicated thread for audio decoding"""
+        try:
+            # Open a separate container for audio
+            audio_container = av.open(self.video_path)
+            audio_stream = audio_container.streams.audio[0]
+            audio_stream.thread_type = 'AUTO'
+            
+            resampler = av.AudioResampler(
+                format=av.AudioFormat('s16').packed,
+                layout='stereo' if self.audio_channels == 2 else 'mono',
+                rate=self.audio_sample_rate
+            )
+            
+            for frame in audio_container.decode(audio=0):
+                if not self.is_playing:
+                    break
+                    
+                try:
+                    # Resample audio frame
+                    frame = resampler.resample(frame)[0]
+                    
+                    # Convert to numpy array
+                    audio_data = frame.to_ndarray()
+                    
+                    # Ensure correct shape (samples, channels)
+                    if audio_data.ndim == 1:
+                        audio_data = audio_data.reshape(-1, 1)
+                    elif audio_data.ndim == 2 and audio_data.shape[0] < audio_data.shape[1]:
+                        audio_data = audio_data.T
+                    
+                    # Convert to float32 for sounddevice
+                    audio_data = audio_data.astype(np.float32) / 32768.0
+                    
+                    # Handle queue full condition
+                    try:
+                        self.audio_queue.put(audio_data, timeout=1.0)
+                    except queue.Full:
+                        # If queue is full, remove oldest item and try again
+                        try:
+                            self.audio_queue.get_nowait()
+                            self.audio_queue.put(audio_data)
+                        except (queue.Empty, queue.Full):
+                            continue
+                            
+                except Exception as e:
+                    print(f"Audio processing error: {e}")
+                    continue
+                    
+            audio_container.close()
+            
+        except Exception as e:
+            print(f"Audio decode thread error: {e}")
+            self.is_playing = False
+
+    def _video_decode_thread(self):
+        """Dedicated thread for video decoding"""
         try:
             video_stream = self.container.streams.video[0]
-            frame_duration = 1.0 / float(video_stream.guessed_rate or 30)
+            stream_time_base = float(video_stream.time_base)
             
             for frame in self.container.decode(video=0):
                 if not self.is_playing:
                     break
                     
-                # Convert frame to numpy array
-                frame_data = frame.to_ndarray(format='rgb24')
-                frame_ts = float(frame.pts * video_stream.time_base)
-                
-                # Put frame in queue
-                try:
-                    self.frame_queue.put((frame_data, frame_ts), timeout=1)
-                except queue.Full:
-                    continue
+                while self.frame_ready and self.is_playing:
+                    time.sleep(0.001)
                     
-                # Handle audio if present
-                if self.audio_stream:
-                    try:
-                        for audio_frame in self.container.decode(audio=0):
-                            if not self.is_playing:
-                                break
-                            try:
-                                self.audio_queue.put_nowait(audio_frame.to_ndarray())
-                            except queue.Full:
-                                break
-                    except Exception as e:
-                        print(f"Audio decode error: {e}")
-                        
+                if not self.is_playing:
+                    break
+                    
+                self.next_frame = frame.to_ndarray(format='rgb24')
+                self.next_frame_pts = float(frame.pts * stream_time_base)
+                self.frame_ready = True
+                
         except Exception as e:
-            print(f"Decode thread error: {e}")
+            print(f"Video decode thread error: {e}")
             self.is_playing = False
-            
+
     def _audio_callback(self, outdata, frames, time_info, status):
         """Callback for audio output"""
         try:
@@ -220,55 +250,106 @@ class VideoPlayer:
                 outdata.fill(0)
                 return
                 
-            data = self.audio_queue.get_nowait()
+            # Try to get data with a small timeout
+            try:
+                data = self.audio_queue.get(timeout=0.1)
+            except queue.Empty:
+                outdata.fill(0)
+                return
+                
+            # Handle output size
             if len(data) < len(outdata):
                 outdata[:len(data)] = data
-                outdata[len(data):] = 0
+                outdata[len(data):].fill(0)
             else:
                 outdata[:] = data[:len(outdata)]
-        except queue.Empty:
-            outdata.fill(0)
+                
         except Exception as e:
             print(f"Audio callback error: {e}")
             outdata.fill(0)
-            
     def play(self):
         """Start video playback"""
         try:
             if not self.is_playing:
                 print("Starting playback...")
                 self.is_playing = True
-                self.container = av.open(self.video_path)
-                
-                # Start decode thread
-                self.decode_thread = threading.Thread(target=self._decode_thread)
-                self.decode_thread.daemon = True
-                self.decode_thread.start()
                 
                 # Start audio if available
-                if self.audio_stream and not self.audio_thread:
+                if self.audio_stream:
                     try:
-                        print("Starting audio...")
-                        with sd.OutputStream(
+                        print("Starting audio stream...")
+                        self.audio_device = sd.OutputStream(
                             channels=self.audio_channels,
                             samplerate=self.audio_sample_rate,
-                            callback=self._audio_callback
-                        ) as self.audio_stream:
-                            self.audio_stream.start()
+                            callback=self._audio_callback,
+                            blocksize=1024,
+                            latency='low'
+                        )
+                        self.audio_device.start()
+                        
+                        # Start audio decode thread
+                        self.audio_thread = threading.Thread(target=self._audio_decode_thread)
+                        self.audio_thread.daemon = True
+                        self.audio_thread.start()
+                        
                     except Exception as e:
                         print(f"Audio start error: {e}")
-                        
+                        self.audio_stream = None
+                
+                # Reset frame state
+                self.frame_ready = False
+                self.next_frame = None
+                self.next_frame_pts = None
+                self.last_frame_time = time.time()
+                
+                # Start video decode thread
+                self.video_thread = threading.Thread(target=self._video_decode_thread)
+                self.video_thread.daemon = True
+                self.video_thread.start()
+                
         except Exception as e:
             print(f"Play error: {e}")
             self.is_playing = False
+
+            
+    def _update_texture(self):
+        try:
+            if self.rotation:
+                k = {90: 1, 180: 2, 270: 3, -90: 3, -180: 2, -270: 1}.get(self.rotation, 0)
+                if k:
+                    self.current_frame = np.ascontiguousarray(np.rot90(self.current_frame, k=k))
+                    
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self.texture_id)
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
+            gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
+            
+            actual_height, actual_width = self.current_frame.shape[:2]
+            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB, 
+                           actual_width, actual_height,
+                           0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, self.current_frame)
+        except Exception as e:
+            print(f"Texture update error: {e}")
             
     def pause(self):
         """Pause video playback"""
         self.is_playing = False
-        # Clear queues
-        while not self.frame_queue.empty():
+        
+        # Stop audio
+        if self.audio_device:
             try:
-                self.frame_queue.get_nowait()
+                self.audio_device.stop()
+                self.audio_device.close()
+                self.audio_device = None
+            except Exception as e:
+                print(f"Error stopping audio: {e}")
+        
+        # Clear audio queue
+        while not self.audio_queue.empty():
+            try:
+                self.audio_queue.get_nowait()
             except queue.Empty:
                 break
                 
@@ -284,18 +365,17 @@ class VideoPlayer:
                 print(f"Cleanup error: {e}")
                 
     def render_gui(self):
-        """Render the video player GUI"""
         try:
-            # Update frame if available
-            if self.is_playing:
-                try:
-                    frame_data, frame_ts = self.frame_queue.get_nowait()
-                    self.current_frame = frame_data
-                    self.current_time = frame_ts
-                    self._update_texture()
-                except queue.Empty:
-                    pass
-                    
+            current_time = time.time()
+            
+            # Check if it's time to display the next frame
+            if self.is_playing and self.frame_ready and (current_time - self.last_frame_time) >= self.frame_interval:
+                self.current_frame = self.next_frame
+                self.current_time = self.next_frame_pts
+                self.frame_ready = False
+                self.last_frame_time = current_time
+                self._update_texture()
+            
             viewport = imgui.get_main_viewport()
             imgui.set_next_window_pos(viewport.pos)
             imgui.set_next_window_size(viewport.size)
@@ -309,60 +389,68 @@ class VideoPlayer:
                 imgui.WindowFlags_.no_saved_settings
             )
             
-            imgui.begin("Video Window", flags=window_flags)
-            
-            # Video display
-            avail_width = imgui.get_content_region_avail().x
-            avail_height = imgui.get_content_region_avail().y - 60
-            
-            if self.rotation in [90, -90, 270, -270]:
-                aspect_ratio = self.frame_height / self.frame_width
-            else:
-                aspect_ratio = self.frame_width / self.frame_height
+            try:
+                imgui.begin("Video Window", flags=window_flags)
                 
-            if avail_width / avail_height > aspect_ratio:
-                display_height = avail_height
-                display_width = avail_height * aspect_ratio
-            else:
-                display_width = avail_width
-                display_height = avail_width / aspect_ratio
+                # Video display
+                avail_width = imgui.get_content_region_avail().x
+                avail_height = imgui.get_content_region_avail().y - 60
                 
-            imgui.set_cursor_pos_x((avail_width - display_width) * 0.5)
-            imgui.image(self.texture_id, imgui.ImVec2(display_width, display_height))
-            
-            imgui.spacing()
-            imgui.spacing()
-            
-            # Controls
-            controls_width = min(avail_width * 0.8, 600)
-            imgui.set_cursor_pos_x((avail_width - controls_width) * 0.5)
-            
-            if imgui.button("Play" if not self.is_playing else "Pause"):
-                if self.is_playing:
-                    self.pause()
+                if self.rotation in [90, -90, 270, -270]:
+                    aspect_ratio = self.frame_height / self.frame_width
                 else:
-                    self.play()
+                    aspect_ratio = self.frame_width / self.frame_height
                     
-            imgui.same_line()
-            
-            # Time slider
-            imgui.push_item_width(controls_width - 100)
-            changed, value = imgui.slider_float(
-                "##time",
-                self.current_time,
-                0,
-                self.duration,
-                "%.2f s"
-            )
-            if changed:
-                self.pause()
-                self.seek_frame(value)
+                if avail_width / avail_height > aspect_ratio:
+                    display_height = avail_height
+                    display_width = avail_height * aspect_ratio
+                else:
+                    display_width = avail_width
+                    display_height = avail_width / aspect_ratio
                 
-            imgui.pop_item_width()
-            imgui.end()
-            
+                imgui.set_cursor_pos_x((avail_width - display_width) * 0.5)
+                imgui.image(self.texture_id, imgui.ImVec2(display_width, display_height))
+                
+                imgui.spacing()
+                imgui.spacing()
+                
+                # Controls
+                controls_width = min(avail_width * 0.8, 600)
+                imgui.set_cursor_pos_x((avail_width - controls_width) * 0.5)
+                
+                if imgui.button("Play" if not self.is_playing else "Pause"):
+                    if self.is_playing:
+                        self.pause()
+                    else:
+                        self.play()
+                        
+                imgui.same_line()
+                
+                # Time slider
+                imgui.push_item_width(controls_width - 100)
+                changed, value = imgui.slider_float(
+                    "##time",
+                    self.current_time,
+                    0,
+                    self.duration,
+                    "%.2f s"
+                )
+                if changed:
+                    self.pause()
+                    self.seek_frame(value)
+                    
+                imgui.pop_item_width()
+                imgui.end()
+                
+            except Exception as e:
+                print(f"ImGui error: {e}")
+                if imgui.get_current_window() is not None:
+                    imgui.end()
+                
         except Exception as e:
             print(f"Render error: {e}")
+            if imgui.get_current_window() is not None:
+                imgui.end()
 
 def main():
     player = None
